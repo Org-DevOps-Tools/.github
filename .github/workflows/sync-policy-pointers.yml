@@ -1,0 +1,166 @@
+name: Sync organization policy pointers
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pull requests for missing policy pointers
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_POLICY_SYNC_TOKEN }}
+          script: |
+            const org = context.repo.owner;
+            const policyRepo = context.repo.repo;
+            const policyBase = `https://github.com/${org}/${policyRepo}/blob/main`;
+            const policies = {
+              'CONTRIBUTING.md': `${policyBase}/CONTRIBUTING.md`,
+              'CODE_OF_CONDUCT.md': `${policyBase}/CODE_OF_CONDUCT.md`,
+              'SECURITY.md': `${policyBase}/SECURITY.md`
+            };
+            const branchName = 'chore/add-organization-policy-pointers';
+
+            const repositories = await github.paginate(github.rest.repos.listForOrg, {
+              org,
+              type: 'all',
+              per_page: 100
+            });
+
+            for (const repository of repositories) {
+              if (repository.name === policyRepo || repository.archived || repository.fork) continue;
+
+              const defaultBranch = repository.default_branch;
+              const baseRef = await github.rest.git.getRef({
+                owner: org,
+                repo: repository.name,
+                ref: `heads/${defaultBranch}`
+              });
+              const baseSha = baseRef.data.object.sha;
+
+              const missing = [];
+              for (const [file, url] of Object.entries(policies)) {
+                try {
+                  await github.rest.repos.getContent({
+                    owner: org,
+                    repo: repository.name,
+                    path: file,
+                    ref: defaultBranch
+                  });
+                } catch (error) {
+                  if (error.status === 404) missing.push({ file, url });
+                  else throw error;
+                }
+              }
+              if (missing.length === 0) continue;
+
+              let branchExists = true;
+              try {
+                await github.rest.git.getRef({
+                  owner: org,
+                  repo: repository.name,
+                  ref: `heads/${branchName}`
+                });
+              } catch (error) {
+                if (error.status === 404) branchExists = false;
+                else throw error;
+              }
+              if (!branchExists) {
+                await github.rest.git.createRef({
+                  owner: org,
+                  repo: repository.name,
+                  ref: `refs/heads/${branchName}`,
+                  sha: baseSha
+                });
+              }
+
+              for (const { file, url } of missing) {
+                const content = `# ${file.replace('.md', '')}\n\nThe organization policy is maintained centrally:\n\n${url}\n\nRepository-specific requirements may be added below this link.\n`;
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner: org,
+                  repo: repository.name,
+                  path: file,
+                  message: `Add organization ${file} pointer`,
+                  content: Buffer.from(content).toString('base64'),
+                  branch: branchName
+                });
+              }
+
+              const existingPulls = await github.paginate(github.rest.pulls.list, {
+                owner: org,
+                repo: repository.name,
+                state: 'open',
+                head: `${org}:${branchName}`,
+                per_page: 100
+              });
+              if (existingPulls.length === 0) {
+                await github.rest.pulls.create({
+                  owner: org,
+                  repo: repository.name,
+                  title: 'Add organization policy pointers',
+                  head: branchName,
+                  base: defaultBranch,
+                  body: `Adds links to the organization policies in [${org}/${policyRepo}](${policyBase}). Existing policy files are never overwritten by this automation.`
+                });
+              }
+            }name: Sync organization policy pointers
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create missing policy pointers
+        env:
+          GH_TOKEN: ${{ secrets.ORG_POLICY_SYNC_TOKEN }}
+          ORG: Org-DevOps-Tools
+          POLICY_REPO: .github
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "ORG_POLICY_SYNC_TOKEN is not configured."
+            exit 1
+          fi
+
+          gh api --paginate "/orgs/${ORG}/repos?per_page=100&type=all" \
+            --jq '.[] | select(.archived == false) | [.name, .default_branch] | @tsv' |
+          while IFS=$'\t' read -r repo branch; do
+            [[ "${repo}" == "${POLICY_REPO}" ]] && continue
+
+            for policy in CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md; do
+              path="repos/${ORG}/${repo}/contents/${policy}?ref=${branch}"
+              if gh api "${path}" >/dev/null 2>&1; then
+                echo "${repo}: keeping existing ${policy}"
+                continue
+              fi
+
+              case "${policy}" in
+                CONTRIBUTING.md) title="Contribution Guidelines" ;;
+                CODE_OF_CONDUCT.md) title="Code of Conduct" ;;
+                SECURITY.md) title="Security Policy" ;;
+              esac
+
+              content=$(printf '# %s\n\nThe organization-wide policy is maintained in [Org-DevOps-Tools/.github](https://github.com/Org-DevOps-Tools/.github/blob/main/%s).\n\nAdd repository-specific instructions below this link when required.\n' "${title}" "${policy}")
+              encoded=$(printf '%s' "${content}" | base64 -w 0)
+
+              gh api --method PUT "repos/${ORG}/${repo}/contents/${policy}" \
+                -f message="Add organization ${policy} pointer" \
+                -f content="${encoded}" \
+                -f branch="${branch}" >/dev/null
+              echo "${repo}: created ${policy}"
+            done
+          done
