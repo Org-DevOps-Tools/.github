@@ -35,6 +35,10 @@ jobs:
 
             for (const repository of repositories) {
               if (repository.name === policyRepo || repository.archived || repository.fork) continue;
+              if (repository.permissions && !repository.permissions.push) {
+                core.warning(`${repository.name}: skipping because the token has no push permission`);
+                continue;
+              }
 
               const defaultBranch = repository.default_branch;
               let baseRef;
@@ -90,6 +94,19 @@ jobs:
               }
 
               for (const { file, url } of missing) {
+                try {
+                  await github.rest.repos.getContent({
+                    owner: org,
+                    repo: repository.name,
+                    path: file,
+                    ref: branchName
+                  });
+                  core.info(`${repository.name}: ${file} already exists on the sync branch`);
+                  continue;
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+
                 const content = `# ${file.replace('.md', '')}\n\nThe organization policy is maintained centrally:\n\n${url}\n\nRepository-specific requirements may be added below this link.\n`;
                 await github.rest.repos.createOrUpdateFileContents({
                   owner: org,
@@ -109,13 +126,21 @@ jobs:
                 per_page: 100
               });
               if (existingPulls.length === 0) {
-                await github.rest.pulls.create({
-                  owner: org,
-                  repo: repository.name,
-                  title: 'Add organization policy pointers',
-                  head: branchName,
-                  base: defaultBranch,
-                  body: `Adds links to the organization policies in [${org}/${policyRepo}](${policyBase}). Existing policy files are never overwritten by this automation.`
-                });
+                try {
+                  await github.rest.pulls.create({
+                    owner: org,
+                    repo: repository.name,
+                    title: 'Add organization policy pointers',
+                    head: branchName,
+                    base: defaultBranch,
+                    body: `Adds links to the organization policies in [${org}/${policyRepo}](${policyBase}). Existing policy files are never overwritten by this automation.`
+                  });
+                } catch (error) {
+                  if (error.status === 403) {
+                    core.warning(`${repository.name}: policy files were created, but the token cannot create a pull request`);
+                    continue;
+                  }
+                  throw error;
+                }
               }
             }
