@@ -37,11 +37,20 @@ jobs:
               if (repository.name === policyRepo || repository.archived || repository.fork) continue;
 
               const defaultBranch = repository.default_branch;
-              const baseRef = await github.rest.git.getRef({
-                owner: org,
-                repo: repository.name,
-                ref: `heads/${defaultBranch}`
-              });
+              let baseRef;
+              try {
+                baseRef = await github.rest.git.getRef({
+                  owner: org,
+                  repo: repository.name,
+                  ref: `heads/${defaultBranch}`
+                });
+              } catch (error) {
+                if (error.status === 409) {
+                  core.info(`${repository.name}: skipping empty repository`);
+                  continue;
+                }
+                throw error;
+              }
               const baseSha = baseRef.data.object.sha;
 
               const missing = [];
